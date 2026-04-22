@@ -90,18 +90,20 @@ if "last_save_ok" not in st.session_state:
 
 @st.cache_data(ttl=1800, show_spinner=False)  # 30-min cache
 def fetch_current_quotes(tickers: tuple[str, ...]) -> dict[str, dict | None]:
-    """Return {ticker: {"price": x, "as_of": iso_str, "source": s, "stale_days": f} or None}."""
+    """Return {ticker: {"price": x, "as_of": iso_str, "source": s, "stale_days": f,
+                         "errors": [list of error strings from failed sources]} or None}."""
     out: dict[str, dict | None] = {}
     for t in tickers:
-        q = price_feed.fetch_current_price(t)
+        q, errors = price_feed.fetch_current_price(t)
         if q is None:
-            out[t] = None
+            out[t] = {"failed": True, "errors": errors}
         else:
             out[t] = {
                 "price": q.price,
                 "as_of": q.as_of.isoformat(),
                 "source": q.source,
                 "stale_days": q.staleness_days,
+                "errors": errors,  # even on success, prior failed sources are recorded
             }
     return out
 
@@ -114,7 +116,8 @@ def fetch_price_history(tickers: tuple[str, ...], start: date, end: date) -> pd.
 def latest_prices_to_series(quotes: dict[str, dict | None]) -> pd.Series:
     """Convert the quotes dict into a pd.Series of prices keyed by ticker.
     Tickers that failed are dropped."""
-    data = {t: q["price"] for t, q in quotes.items() if q is not None}
+    data = {t: q["price"] for t, q in quotes.items()
+            if q is not None and not q.get("failed") and "price" in q}
     return pd.Series(data, dtype=float)
 
 
@@ -324,9 +327,24 @@ with st.sidebar:
         load_initial_data()
         st.rerun()
 
+    with st.expander("🩺 Test price feed (diagnostic)"):
+        st.caption("Fetches CW8 live from each source individually. Use this to "
+                   "see which sources are reachable from this server.")
+        if st.button("Run diagnostic"):
+            import price_feed as pf
+            with st.spinner("Testing…"):
+                q1, e1 = pf.fetch_yahoo("EPA:CW8")
+                q2, e2 = pf.fetch_boursorama("EPA:CW8")
+                q3, e3 = pf.fetch_stooq("EPA:CW8")
+            for name, q, e in [("Yahoo", q1, e1), ("Boursorama", q2, e2), ("Stooq", q3, e3)]:
+                if q is not None:
+                    st.success(f"**{name}**: €{q.price:.2f} (as of {q.as_of.strftime('%Y-%m-%d %H:%M UTC')})")
+                else:
+                    st.error(f"**{name}**: {e or 'failed with no error message'}")
+
     with st.expander("ℹ️ About"):
         st.markdown(
-            "- Prices: **Stooq → Yahoo → Boursorama** waterfall, 30-min cache\n"
+            "- Prices: **Yahoo → Boursorama → Stooq** waterfall, 30-min cache\n"
             "- Transactions: Google Sheets (via service account)\n"
             "- Returns: time-weighted (cashflow-neutral)\n"
             "- Annualization: skipped for holdings <6 months"
@@ -368,7 +386,8 @@ if not transactions.empty:
     with st.spinner("Fetching live prices from Stooq / Yahoo / Boursorama…"):
         quotes = fetch_current_quotes(tuple(tickers_used))
 
-    missing = [t for t in tickers_used if quotes.get(t) is None]
+    missing = [t for t in tickers_used
+               if quotes.get(t) is None or quotes[t].get("failed")]
 
     # Also fetch historical for the charts + TWR computation
     with st.spinner("Fetching price history…"):
@@ -377,8 +396,6 @@ if not transactions.empty:
     current_price_series = latest_prices_to_series(quotes)
 
     # For any ticker missing history but with a current price, seed with that
-    # (so positions tab doesn't crash). This only affects tickers with zero
-    # historical data from Yahoo — rare.
     for t in tickers_used:
         if t not in history.columns:
             if t in current_price_series.index:
@@ -387,11 +404,31 @@ if not transactions.empty:
                 history[t] = current_price_series[t]
 
     if missing:
-        st.error(
-            f"❌ Could not fetch current prices for: **{', '.join(missing)}**. "
-            "The dashboard excludes these positions from current valuation."
-        )
-        # Drop them from analytics
+        with st.container(border=True):
+            st.error(
+                f"❌ Could not fetch current prices for: **{', '.join(missing)}**. "
+                "These positions are excluded from current valuation."
+            )
+            with st.expander("🔍 Diagnostic details — why each source failed", expanded=True):
+                for t in missing:
+                    errs = quotes.get(t, {}).get("errors", []) if quotes.get(t) else []
+                    st.markdown(f"**{t}**")
+                    if errs:
+                        for e in errs:
+                            st.code(e, language=None)
+                    else:
+                        st.write("_No error details available._")
+                st.markdown(
+                    "---\n"
+                    "**Common causes:**\n"
+                    "- `HTTP 403` → the data source is blocking Python requests. "
+                    "Try **🔄 Refresh prices** in the sidebar (different headers may be retried).\n"
+                    "- `HTTP 429` → rate-limited. Wait a minute.\n"
+                    "- `connection error` → Streamlit Cloud outbound network issue, "
+                    "usually self-resolves within minutes.\n"
+                    "- `no price pattern matched` → source page HTML changed. "
+                    "Needs a code update to `price_feed.py`."
+                )
         for t in missing:
             if t in history.columns:
                 history = history.drop(columns=[t])
@@ -468,7 +505,7 @@ with tab_master:
         feed_rows = []
         for t in tickers_used:
             q = quotes.get(t)
-            if q is None:
+            if q is None or q.get("failed"):
                 feed_rows.append({
                     "Ticker": t, "Price": None, "Source": "—",
                     "As of": "—", "Status": "❌ unavailable",

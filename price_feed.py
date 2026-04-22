@@ -25,15 +25,36 @@ from typing import Callable
 import pandas as pd
 import requests
 
-HTTP_TIMEOUT = 8  # seconds
+HTTP_TIMEOUT = 10  # seconds
 HTTP_HEADERS = {
-    # Pretend to be a normal browser so we don't get 403'd on scrapes
+    # Real browser User-Agent + full header set to avoid bot detection
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/128.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Separate, lighter headers for JSON API calls
+JSON_HEADERS = {
+    "User-Agent": HTTP_HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://finance.yahoo.com",
+    "Referer": "https://finance.yahoo.com/",
 }
 
 # Map our internal EPA:XXX codes to each source's ticker format.
@@ -71,32 +92,28 @@ class Quote:
 # Source 1 — Stooq
 # =====================================================================
 
-def fetch_stooq(ticker: str) -> Quote | None:
+def fetch_stooq(ticker: str) -> tuple[Quote | None, str | None]:
     """Fetch current price from Stooq CSV API.
-    Endpoint: https://stooq.com/q/l/?s=<symbol>&f=sd2t2ohlcv&h&e=csv
-    Returns columns: Symbol,Date,Time,Open,High,Low,Close,Volume.
-    """
+    Returns (Quote, None) on success, (None, error_message) on failure."""
     sym = SOURCE_TICKERS.get(ticker, {}).get("stooq")
     if not sym:
-        return None
+        return None, "no Stooq symbol mapping"
     url = f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
     try:
         r = requests.get(url, timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS)
-        r.raise_for_status()
+        if r.status_code != 200:
+            return None, f"Stooq HTTP {r.status_code}"
         lines = r.text.strip().split("\n")
         if len(lines) < 2:
-            return None
+            return None, f"Stooq returned no data (body: {r.text[:80]!r})"
         headers = [h.strip().lower() for h in lines[0].split(",")]
         values = [v.strip() for v in lines[1].split(",")]
         row = dict(zip(headers, values))
-        # Stooq returns "N/D" in all fields if the ticker is unknown
         if row.get("close", "N/D") in ("N/D", "", "0"):
-            return None
+            return None, f"Stooq: ticker not found or no price ({row})"
         price = float(row["close"])
         if price <= 0:
-            return None
-        # Parse date + time (UTC assumption — stooq is actually US/ET for close times,
-        # but for a daily close this is fine within a day's precision)
+            return None, f"Stooq: invalid price {price}"
         d_str = row.get("date", "")
         t_str = row.get("time", "00:00:00")
         try:
@@ -104,62 +121,73 @@ def fetch_stooq(ticker: str) -> Quote | None:
         except ValueError:
             ts = datetime.strptime(d_str, "%Y-%m-%d") if d_str else datetime.utcnow()
         ts = ts.replace(tzinfo=timezone.utc)
-        return Quote(price=price, as_of=ts, source="Stooq", ticker=ticker)
-    except Exception:
-        return None
+        return Quote(price=price, as_of=ts, source="Stooq", ticker=ticker), None
+    except requests.exceptions.Timeout:
+        return None, "Stooq: request timed out"
+    except requests.exceptions.ConnectionError as e:
+        return None, f"Stooq: connection error ({type(e).__name__})"
+    except Exception as e:
+        return None, f"Stooq: {type(e).__name__}: {e}"
 
 
 # =====================================================================
 # Source 2 — Yahoo Finance chart JSON API
 # =====================================================================
 
-def fetch_yahoo(ticker: str) -> Quote | None:
-    """Fetch current price from Yahoo Finance chart endpoint.
-    Endpoint: https://query1.finance.yahoo.com/v8/finance/chart/<ticker>
-    """
+def fetch_yahoo(ticker: str) -> tuple[Quote | None, str | None]:
+    """Fetch current price from Yahoo Finance chart endpoint."""
     sym = SOURCE_TICKERS.get(ticker, {}).get("yahoo")
     if not sym:
-        return None
+        return None, "no Yahoo symbol mapping"
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
     try:
         r = requests.get(
             url,
             timeout=HTTP_TIMEOUT,
-            headers=HTTP_HEADERS,
+            headers=JSON_HEADERS,
             params={"interval": "1d", "range": "5d"},
         )
-        r.raise_for_status()
+        if r.status_code != 200:
+            return None, f"Yahoo HTTP {r.status_code}"
         data = r.json()
         result = (data.get("chart") or {}).get("result") or []
         if not result:
-            return None
+            err = (data.get("chart") or {}).get("error")
+            return None, f"Yahoo: no result ({err})" if err else "Yahoo: empty result"
         meta = result[0].get("meta") or {}
         price = meta.get("regularMarketPrice")
         ts_unix = meta.get("regularMarketTime")
-        if price is None or not price or ts_unix is None:
-            return None
+        if price is None:
+            return None, "Yahoo: no price in response"
+        if ts_unix is None:
+            return None, "Yahoo: no timestamp in response"
         ts = datetime.fromtimestamp(int(ts_unix), tz=timezone.utc)
-        return Quote(price=float(price), as_of=ts, source="Yahoo", ticker=ticker)
-    except Exception:
-        return None
+        return Quote(price=float(price), as_of=ts, source="Yahoo", ticker=ticker), None
+    except requests.exceptions.Timeout:
+        return None, "Yahoo: request timed out"
+    except requests.exceptions.ConnectionError as e:
+        return None, f"Yahoo: connection error ({type(e).__name__})"
+    except ValueError as e:  # JSON decode error
+        return None, f"Yahoo: invalid JSON ({e})"
+    except Exception as e:
+        return None, f"Yahoo: {type(e).__name__}: {e}"
 
 
 def fetch_yahoo_history(ticker: str, start: date, end: date) -> pd.Series | None:
-    """Fetch historical daily closes from Yahoo's chart endpoint.
-    Returns a pd.Series indexed by date, or None on failure."""
+    """Historical daily closes from Yahoo."""
     sym = SOURCE_TICKERS.get(ticker, {}).get("yahoo")
     if not sym:
         return None
-    # Use period1/period2 unix timestamps
     p1 = int(datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc).timestamp())
     p2 = int(datetime.combine(end + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc).timestamp())
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
     try:
         r = requests.get(
-            url, timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS,
+            url, timeout=HTTP_TIMEOUT, headers=JSON_HEADERS,
             params={"period1": p1, "period2": p2, "interval": "1d"},
         )
-        r.raise_for_status()
+        if r.status_code != 200:
+            return None
         data = r.json()
         result = (data.get("chart") or {}).get("result") or []
         if not result:
@@ -202,18 +230,18 @@ def _parse_french_number(s: str) -> float | None:
         return None
 
 
-def fetch_boursorama(ticker: str) -> Quote | None:
+def fetch_boursorama(ticker: str) -> tuple[Quote | None, str | None]:
     """Scrape current price from Boursorama. Tries multiple HTML patterns."""
     slug = SOURCE_TICKERS.get(ticker, {}).get("boursorama")
     if not slug:
-        return None
+        return None, "no Boursorama symbol mapping"
     url = f"https://www.boursorama.com/bourse/trackers/cours/{slug}/"
     try:
         r = requests.get(url, timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS)
-        r.raise_for_status()
+        if r.status_code != 200:
+            return None, f"Boursorama HTTP {r.status_code}"
         html = r.text
 
-        # Try each pattern in order; first match wins
         price = None
         for pat in BOURSORAMA_PATTERNS:
             m = pat.search(html)
@@ -223,9 +251,25 @@ def fetch_boursorama(ticker: str) -> Quote | None:
                     price = p
                     break
         if price is None:
-            return None
+            # Try an alternative URL for stocks (1rP prefix instead of 1rT)
+            alt_slug = slug.replace("1rT", "1rP")
+            if alt_slug != slug:
+                r2 = requests.get(
+                    f"https://www.boursorama.com/cours/{alt_slug}/",
+                    timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS,
+                )
+                if r2.status_code == 200:
+                    for pat in BOURSORAMA_PATTERNS:
+                        m = pat.search(r2.text)
+                        if m:
+                            p = _parse_french_number(m.group(1))
+                            if p is not None and p > 0:
+                                price = p
+                                html = r2.text
+                                break
+        if price is None:
+            return None, "Boursorama: no price pattern matched in HTML"
 
-        # Try to extract the "as of" timestamp
         ts = datetime.now(timezone.utc)
         m2 = BOURSORAMA_ASOF_RE.search(html)
         if m2:
@@ -245,51 +289,51 @@ def fetch_boursorama(ticker: str) -> Quote | None:
                                   hour, minute, second, tzinfo=timezone.utc)
                 except (ValueError, IndexError):
                     pass
-        return Quote(price=price, as_of=ts, source="Boursorama", ticker=ticker)
-    except Exception:
-        return None
+        return Quote(price=price, as_of=ts, source="Boursorama", ticker=ticker), None
+    except requests.exceptions.Timeout:
+        return None, "Boursorama: request timed out"
+    except requests.exceptions.ConnectionError as e:
+        return None, f"Boursorama: connection error ({type(e).__name__})"
+    except Exception as e:
+        return None, f"Boursorama: {type(e).__name__}: {e}"
 
 
 # =====================================================================
 # Orchestration
 # =====================================================================
 
-def fetch_current_price(ticker: str) -> Quote | None:
-    """Try each source in order, return the freshest result found.
-    If all sources fail, returns None.
+def fetch_current_price(ticker: str) -> tuple[Quote | None, list[str]]:
+    """Try each source in order, return (freshest Quote or None, list_of_errors).
 
-    Order: Yahoo JSON (most reliable for EUR ETFs), then Boursorama
-    (French broker, always fresh), then Stooq (tertiary, may be rate-limited).
+    The errors list lets callers show users WHY a ticker failed.
     """
     quotes: list[Quote] = []
+    errors: list[str] = []
     for fetcher in (fetch_yahoo, fetch_boursorama, fetch_stooq):
-        q = fetcher(ticker)
+        q, err = fetcher(ticker)
         if q is not None:
             quotes.append(q)
-            # If this source is fresh (within ~1 trading day), we can stop
             if q.staleness_days < 1.5:
                 break
+        elif err:
+            errors.append(err)
 
     if not quotes:
-        return None
-    return min(quotes, key=lambda x: x.staleness_days)
+        return None, errors
+    return min(quotes, key=lambda x: x.staleness_days), errors
 
 
-def fetch_all_current_prices(tickers: list[str]) -> dict[str, Quote | None]:
-    """Fetch current prices for many tickers. Returns {ticker: Quote or None}."""
-    out: dict[str, Quote | None] = {}
+def fetch_all_current_prices(tickers: list[str]) -> dict[str, tuple[Quote | None, list[str]]]:
+    """Fetch current prices for many tickers."""
+    out: dict[str, tuple[Quote | None, list[str]]] = {}
     for t in tickers:
         out[t] = fetch_current_price(t)
-        # Be a good web citizen
-        time.sleep(0.1)
+        time.sleep(0.15)
     return out
 
 
 def fetch_history(tickers: list[str], start: date, end: date) -> pd.DataFrame:
-    """Fetch historical daily closes. Currently uses Yahoo only (the only source
-    with a clean daily-history API). Returns a DataFrame indexed by date with
-    one column per internal ticker. Missing data is NaN, forward-filled at the
-    end so all business days are present."""
+    """Historical daily closes via Yahoo JSON."""
     series_list = []
     for t in tickers:
         s = fetch_yahoo_history(t, start, end)
@@ -298,7 +342,6 @@ def fetch_history(tickers: list[str], start: date, end: date) -> pd.DataFrame:
             series_list.append(s)
 
     if not series_list:
-        # Return empty DF with a reasonable business-day index
         return pd.DataFrame(index=pd.bdate_range(start=start, end=end))
 
     df = pd.concat(series_list, axis=1)
